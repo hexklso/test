@@ -1,0 +1,186 @@
+import telebot
+import os
+import subprocess
+import threading
+import uuid
+import time
+import requests
+import signal
+
+# تحميل الخط العربي
+font_url = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoNaskhArabic/NotoNaskhArabic-Regular.ttf"
+font_path = "/root/.fonts/NotoNaskhArabic-Regular.ttf"
+os.makedirs("/root/.fonts", exist_ok=True)
+if not os.path.exists(font_path):
+    with open(font_path, "wb") as f:
+        f.write(requests.get(font_url).content)
+
+# إعداد التوكن
+TOKEN = 'ضع_توكن_البوت_هنا'
+bot = telebot.TeleBot(TOKEN)
+
+# المسؤول
+ADMIN_ID = 123456789  # ← غيّره إلى معرفك
+
+# تحميل المشتركين
+def load_subscribers():
+    if not os.path.exists("subscribers.txt"):
+        return set()
+    with open("subscribers.txt", "r") as f:
+        return set(int(line.strip()) for line in f if line.strip().isdigit())
+
+def save_subscriber(user_id):
+    subscribers.add(user_id)
+    with open("subscribers.txt", "a") as f:
+        f.write(f"{user_id}\n")
+
+subscribers = load_subscribers()
+streams = {}  # {chat_id: {id, m3u8, fb_key, text_path, process}}
+
+# البداية
+@bot.message_handler(commands=['start'])
+def start(message):
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("🎬 تجهيز البث", "📝 تغيير اسم البث")
+    markup.row("❌ إزالة الاسم", "⛔ إيقاف البث")
+    bot.send_message(message.chat.id, "مرحبًا 👋\nاختر ما تريد فعله:", reply_markup=markup)
+
+# إضافة مشترك
+@bot.message_handler(commands=['addsub'])
+def add_subscriber(message):
+    if message.chat.id != ADMIN_ID:
+        return bot.send_message(message.chat.id, "❌ هذا الأمر للمسؤول فقط.")
+    bot.send_message(message.chat.id, "📨 أرسل معرف المستخدم:")
+    bot.register_next_step_handler(message, process_add_sub)
+
+def process_add_sub(message):
+    try:
+        user_id = int(message.text.strip())
+        if user_id in subscribers:
+            bot.send_message(message.chat.id, "✅ المشترك موجود مسبقًا.")
+        else:
+            save_subscriber(user_id)
+            bot.send_message(message.chat.id, f"✅ تمت الإضافة: {user_id}")
+    except:
+        bot.send_message(message.chat.id, "❌ يرجى إدخال معرف رقمي صحيح.")
+
+# تجهيز البث
+@bot.message_handler(func=lambda m: m.text == "🎬 تجهيز البث")
+def prepare_stream(message):
+    if message.chat.id not in subscribers and message.chat.id != ADMIN_ID:
+        return bot.send_message(message.chat.id, "❌ هذه الميزة للمشتركين فقط.")
+    if message.chat.id in streams and 'process' in streams[message.chat.id]:
+        return bot.send_message(message.chat.id, "⚠️ يوجد بث نشط بالفعل. أوقفه أولًا.")
+    bot.send_message(message.chat.id, "🔗 أرسل رابط m3u8:")
+    bot.register_next_step_handler(message, get_m3u8)
+
+def get_m3u8(message):
+    streams[message.chat.id] = {}
+    streams[message.chat.id]['m3u8'] = message.text
+    bot.send_message(message.chat.id, "🎥 أرسل مفتاح Facebook Live:")
+    bot.register_next_step_handler(message, get_key)
+
+def get_key(message):
+    chat_id = message.chat.id
+    key = message.text
+    stream_id = str(uuid.uuid4())[:8]
+    text_path = f"text_{stream_id}.txt"
+
+    streams[chat_id].update({
+        'fb_key': key,
+        'id': stream_id,
+        'text_path': text_path
+    })
+
+    with open(text_path, 'w') as f:
+        f.write('')
+
+    thread = threading.Thread(target=start_stream, args=(chat_id,))
+    thread.start()
+    bot.send_message(chat_id, f"✅ تم بدء البث.\nمعرف البث: `{stream_id}`", parse_mode="Markdown")
+
+# بدء البث
+def start_stream(chat_id):
+    m3u8 = streams[chat_id]['m3u8']
+    fb_key = streams[chat_id]['fb_key']
+    text_path = streams[chat_id]['text_path']
+    stream_id = streams[chat_id]['id']
+    fb_url = f"rtmps://live-api-s.facebook.com:443/rtmp/{fb_key}"
+
+    script = f"""
+    while true
+    do
+        ffmpeg -re -i "{m3u8}" \\
+        -vf "drawtext=fontfile=/root/.fonts/NotoNaskhArabic-Regular.ttf:textfile='{text_path}':reload=1:fontcolor=white:fontsize=36:x=(w-text_w)/2:y=20:box=1:boxcolor=black@0.5" \\
+        -c:v libx264 -preset veryfast -maxrate 3000k -bufsize 6000k \\
+        -c:a aac -b:a 128k -ar 44100 -ac 2 -f flv "{fb_url}"
+        echo "تم التوقف... إعادة المحاولة خلال 5 ثوانٍ"
+        sleep 5
+    done
+    """
+
+    script_path = f"run_{stream_id}.sh"
+    with open(script_path, "w") as f:
+        f.write(script)
+    os.chmod(script_path, 0o755)
+
+    process = subprocess.Popen(["bash", script_path], preexec_fn=os.setsid)
+    streams[chat_id]['process'] = process
+
+# تغيير الاسم
+@bot.message_handler(func=lambda m: m.text == "📝 تغيير اسم البث")
+def ask_for_name(message):
+    bot.send_message(message.chat.id, "✏️ أرسل الاسم الجديد:")
+    bot.register_next_step_handler(message, set_name)
+
+def set_name(message):
+    chat_id = message.chat.id
+    if chat_id not in streams:
+        return bot.send_message(chat_id, "❌ لا يوجد بث جاري.")
+    path = streams[chat_id]['text_path']
+    with open(path, 'w') as f:
+        f.write(message.text)
+    bot.send_message(chat_id, "✅ تم تحديث الاسم.")
+
+# إزالة الاسم
+@bot.message_handler(func=lambda m: m.text == "❌ إزالة الاسم")
+def ask_for_id(message):
+    bot.send_message(message.chat.id, "🆔 أرسل معرف البث:")
+    bot.register_next_step_handler(message, remove_name)
+
+def remove_name(message):
+    stream_id = message.text.strip()
+    for chat_id, data in streams.items():
+        if data.get('id') == stream_id:
+            with open(data['text_path'], 'w') as f:
+                f.write('')
+            bot.send_message(chat_id, "✅ تم إزالة الاسم من الفيديو.")
+            return
+    bot.send_message(message.chat.id, "❌ لم يتم العثور على معرف مطابق.")
+
+# إيقاف البث
+@bot.message_handler(func=lambda m: m.text == "⛔ إيقاف البث")
+def stop_stream(message):
+    chat_id = message.chat.id
+    if chat_id in streams and 'process' in streams[chat_id]:
+        process = streams[chat_id]['process']
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ فشل في إيقاف البث: {e}")
+            return
+
+        text_path = streams[chat_id]['text_path']
+        script_path = f"run_{streams[chat_id]['id']}.sh"
+        if os.path.exists(text_path):
+            os.remove(text_path)
+        if os.path.exists(script_path):
+            os.remove(script_path)
+
+        del streams[chat_id]
+        bot.send_message(chat_id, "🛑 تم إيقاف البث بنجاح.")
+    else:
+        bot.send_message(chat_id, "❌ لا يوجد بث نشط.")
+
+# تشغيل البوت
+bot.polling()
